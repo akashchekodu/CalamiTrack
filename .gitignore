@@ -1,3 +1,6 @@
 .env
 
 env/
+spark-stream/artifacts
+spark-stream/checkpoints
+spark-stream/output
