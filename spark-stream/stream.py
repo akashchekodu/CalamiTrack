@@ -2,8 +2,14 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, to_timestamp, window, count, avg
 from pyspark.sql.types import StructType, StringType, DoubleType, LongType
 
-# 1️⃣ Define schema
-schema = StructType() \
+# Spark session
+spark = SparkSession.builder \
+    .appName("MultiHazardStreamProcessor") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# 🟠 Earthquake schema
+eq_schema = StructType() \
     .add("id", StringType()) \
     .add("place", StringType()) \
     .add("magnitude", DoubleType()) \
@@ -20,57 +26,72 @@ schema = StructType() \
     .add("gap", DoubleType()) \
     .add("rms", DoubleType())
 
-# 2️⃣ Start Spark session
-spark = SparkSession.builder \
-    .appName("EarthquakeStreamProcessor") \
-    .getOrCreate()
-spark.sparkContext.setLogLevel("WARN")
+# 🔴 Wildfire schema (VIIRS)
+fire_schema = StructType() \
+    .add("latitude", DoubleType()) \
+    .add("longitude", DoubleType()) \
+    .add("brightness", DoubleType()) \
+    .add("scan", DoubleType()) \
+    .add("track", DoubleType()) \
+    .add("acq_date", StringType()) \
+    .add("acq_time", StringType()) \
+    .add("satellite", StringType()) \
+    .add("confidence", StringType()) \
+    .add("version", StringType()) \
+    .add("type", StringType()) \
+    .add("daynight", StringType()) \
+    .add("location", StringType())
 
-# 3️⃣ Read Kafka stream
-df = spark.readStream.format("kafka") \
+# 📡 Read Earthquake Kafka stream
+eq_stream = spark.readStream.format("kafka") \
     .option("kafka.bootstrap.servers", "localhost:9092") \
     .option("subscribe", "earthquakes") \
     .load()
 
-# 4️⃣ Parse Kafka stream and create event_time column
-json_df = df.selectExpr("CAST(value AS STRING) as json_str") \
-    .select(from_json(col("json_str"), schema).alias("data")) \
+eq_df = eq_stream.selectExpr("CAST(value AS STRING)") \
+    .select(from_json(col("value"), eq_schema).alias("data")) \
     .select("data.*") \
     .withColumn("event_time", to_timestamp("time_str"))
 
-# 5️⃣ High magnitude filter
-high_mag = json_df.filter(col("magnitude") > 1.0)
+# 📡 Read Wildfire Kafka stream
+fire_stream = spark.readStream.format("kafka") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "wildfires") \
+    .load()
 
-# 6️⃣ Aggregation: quake count and avg magnitude per 10-min window
-agg_df = json_df \
-    .withWatermark("event_time", "30 minutes") \
-    .groupBy(window(col("event_time"), "10 minutes")) \
-    .agg(
-        count("*").alias("quake_count"),
-        avg("magnitude").alias("avg_magnitude")
-    )
+fire_df = fire_stream.selectExpr("CAST(value AS STRING)") \
+    .select(from_json(col("value"), fire_schema).alias("data")) \
+    .select("data.*") \
+    .withColumn("event_time", to_timestamp("acq_date", "yyyy-MM-dd"))
 
-# 7️⃣ File sink to store raw stream (CSV format)
-file_sink = json_df.writeStream \
+# 💾 Write Earthquake Stream to Disk
+eq_sink = eq_df.writeStream \
     .format("csv") \
     .option("path", "output/earthquake_stream") \
     .option("checkpointLocation", "checkpoints/earthquake_stream") \
     .outputMode("append") \
     .start()
 
-# 8️⃣ Console sink for high magnitude alerts
-console_highmag = high_mag.writeStream \
+# 💾 Write Wildfire Stream to Disk
+fire_sink = fire_df.writeStream \
+    .format("csv") \
+    .option("path", "output/wildfire_stream") \
+    .option("checkpointLocation", "checkpoints/wildfire_stream") \
+    .outputMode("append") \
+    .start()
+
+# 🖥️ Optional: Console output for monitoring
+console_eq = eq_df.filter(col("magnitude") > 3.5).writeStream \
     .outputMode("append") \
     .format("console") \
     .option("truncate", "false") \
     .start()
 
-# 9️⃣ Console sink for aggregated stats
-console_agg = agg_df.writeStream \
-    .outputMode("complete") \
+console_fire = fire_df.filter(col("confidence") == "nominal").writeStream \
+    .outputMode("append") \
     .format("console") \
     .option("truncate", "false") \
     .start()
 
-# 🔟 Await all queries
+# ⏳ Wait
 spark.streams.awaitAnyTermination()
